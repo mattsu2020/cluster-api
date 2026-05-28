@@ -33,11 +33,14 @@ import (
 	"sigs.k8s.io/cluster-api/internal/controllers/machinedeployment/mdutil"
 	"sigs.k8s.io/cluster-api/internal/util/inplace"
 	"sigs.k8s.io/cluster-api/util"
-	"sigs.k8s.io/cluster-api/util/collections"
 )
 
 // rolloutRollingUpdate reconcile machine sets controlled by a MachineDeployment that is using the RolloutUpdate strategy.
-func (r *Reconciler) rolloutRollingUpdate(ctx context.Context, md *clusterv1.MachineDeployment, msList []*clusterv1.MachineSet, machines collections.Machines, templateExists bool) error {
+func (r *Reconciler) rolloutRollingUpdate(ctx context.Context, s *scope, templateExists bool) error {
+	md := s.machineDeployment
+	msList := s.machineSets
+	machines := s.machines
+
 	planner := newRolloutPlanner(r.Client, r.RuntimeClient, r.canUpdateMachineSetCache)
 	if err := planner.init(ctx, md, msList, machines.UnsortedList(), true, templateExists); err != nil {
 		return err
@@ -54,6 +57,11 @@ func (r *Reconciler) rolloutRollingUpdate(ctx context.Context, md *clusterv1.Mac
 	newMS := planner.newMS
 	oldMSs := planner.oldMSs
 	allMSs := append(oldMSs, newMS)
+
+	// Store planner results in scope so defer's updateStatus() uses the planner's
+	// newMS/oldMSs instead of recomputing from potentially stale s.machineSets.
+	s.newMS = newMS
+	s.oldMSs = oldMSs
 
 	if err := r.syncDeploymentStatus(allMSs, newMS, md); err != nil {
 		return err

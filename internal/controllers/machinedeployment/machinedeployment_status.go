@@ -51,8 +51,9 @@ func (r *Reconciler) updateStatus(ctx context.Context, s *scope) (retErr error) 
 	s.machineDeployment.Status.Selector = selector.String()
 
 	// Partition MachineSets into new (matching current template) and old (outdated template).
-	// This is used for replica counters and condition computation.
-	if s.getAndAdoptMachineSetsForDeploymentSucceeded {
+	// Prefer planner results stored in scope during reconcile body (more accurate for newly created MS).
+	// Fall back to computing from s.machineSets when planner didn't run (e.g. deletion path).
+	if s.getAndAdoptMachineSetsForDeploymentSucceeded && s.newMS == nil && s.oldMSs == nil {
 		newMS, oldMSs, _, _ := mdutil.FindNewAndOldMachineSets(s.machineDeployment, s.machineSets, metav1.Now())
 		s.newMS = newMS
 		s.oldMSs = oldMSs
@@ -207,7 +208,8 @@ func setRollingOutCondition(_ context.Context, machineDeployment *clusterv1.Mach
 	// Also detect pending rollouts from MachineSet state. When old MachineSets have replicas
 	// and a new MachineSet exists with a different template, a rollout is in progress even
 	// if individual machine UpToDate conditions haven't been updated yet.
-	// This prevents observedGeneration from advancing while conditions still reflect the old state.
+	// This makes the MachineDeployment status reflect a pending rollout in the same patch
+	// that advances observedGeneration, even before individual Machine UpToDate conditions are updated.
 	if rollingOutReplicas == 0 && len(oldMSs) > 0 && newMS != nil {
 		oldReplicas := int32(0)
 		for _, oldMS := range oldMSs {
@@ -411,8 +413,8 @@ func setMachinesUpToDateCondition(ctx context.Context, machineDeployment *cluste
 	log := ctrl.LoggerFrom(ctx)
 
 	// If there are old MachineSets with replicas, machines are not up-to-date even if their
-	// individual UpToDate condition hasn't been updated yet. This prevents the condition from
-	// reporting True when a rollout is pending but machine controllers haven't caught up.
+	// individual UpToDate condition hasn't been updated yet. This makes the MachinesUpToDate
+	// condition reflect the pending rollout in the same patch that advances observedGeneration.
 	if newMS != nil && len(oldMSs) > 0 {
 		oldReplicas := int32(0)
 		for _, oldMS := range oldMSs {

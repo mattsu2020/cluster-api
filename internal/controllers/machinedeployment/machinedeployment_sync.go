@@ -32,13 +32,16 @@ import (
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/internal/controllers/machinedeployment/mdutil"
-	"sigs.k8s.io/cluster-api/util/collections"
 	v1beta1conditions "sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1"
 )
 
 // sync is responsible for reconciling deployments on scaling events or when they
 // are paused.
-func (r *Reconciler) sync(ctx context.Context, md *clusterv1.MachineDeployment, msList []*clusterv1.MachineSet, machines collections.Machines, templateExists bool) error {
+func (r *Reconciler) sync(ctx context.Context, s *scope, templateExists bool) error {
+	md := s.machineDeployment
+	msList := s.machineSets
+	machines := s.machines
+
 	// Use the rollout planner to take benefit of the common logic for:
 	// - identifying newMS and OldMS when necessary
 	// - computing desired state for newMS and OldMS, including managing rollout related annotations and
@@ -67,6 +70,11 @@ func (r *Reconciler) sync(ctx context.Context, md *clusterv1.MachineDeployment, 
 	newMS := planner.newMS
 	oldMSs := planner.oldMSs
 	allMSs := append(oldMSs, newMS)
+
+	// Store planner results in scope so defer's updateStatus() uses the planner's
+	// newMS/oldMSs instead of recomputing from potentially stale s.machineSets.
+	s.newMS = newMS
+	s.oldMSs = oldMSs
 
 	// Note: Consider if to move the scale logic to the rollout planner as well, so we can improve test coverage
 	//  like we did for RolloutUpdate and OnDelete strategy.
@@ -220,15 +228,21 @@ func (r *Reconciler) scale(ctx context.Context, deployment *clusterv1.MachineDep
 }
 
 // syncDeploymentStatus checks if the status is up-to-date and sync it if necessary.
-// Note: Replica counters are computed in the defer block's updateStatus() to avoid
-// dual-computation issues where observedGeneration advances before status fields are consistent.
+// Note: Replica counters are computed here so DeploymentComplete() has fresh values, and also
+// in the defer block's updateStatus() which is the authoritative source before patching.
 func (r *Reconciler) syncDeploymentStatus(allMSs []*clusterv1.MachineSet, newMS *clusterv1.MachineSet, md *clusterv1.MachineDeployment) error {
+	// Set replica counters on MD status.
+	// UpToDateReplicas counts only machines matching the current template (new MS).
+	setReplicas(md, allMSs, newMS)
 	calculateV1Beta1Status(allMSs, newMS, md)
 
 	// minReplicasNeeded will be equal to md.Spec.Replicas when the strategy is not RollingUpdateMachineDeploymentStrategyType.
 	minReplicasNeeded := *(md.Spec.Replicas) - mdutil.MaxUnavailable(*md)
 
-	availableReplicas := ptr.Deref(md.Status.AvailableReplicas, 0)
+		availableReplicas := int32(0)
+		if md.Status.Deprecated != nil && md.Status.Deprecated.V1Beta1 != nil {
+			availableReplicas = md.Status.Deprecated.V1Beta1.AvailableReplicas
+		}
 	if availableReplicas >= minReplicasNeeded {
 		// NOTE: The structure of calculateV1Beta1Status() does not allow us to update the machinedeployment directly, we can only update the status obj it returns. Ideally, we should change calculateV1Beta1Status() --> updateStatus() to be consistent with the rest of the code base, until then, we update conditions here.
 		v1beta1conditions.MarkTrue(md, clusterv1.MachineDeploymentAvailableV1Beta1Condition)

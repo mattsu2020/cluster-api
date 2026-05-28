@@ -337,15 +337,15 @@ func (r *Reconciler) reconcile(ctx context.Context, s *scope) error {
 	templateExists := s.infrastructureTemplateExists && (!md.Spec.Template.Spec.Bootstrap.ConfigRef.IsDefined() || s.bootstrapTemplateExists)
 
 	if ptr.Deref(md.Spec.Paused, false) {
-		return r.sync(ctx, md, s.machineSets, s.machines, templateExists)
+		return r.sync(ctx, s, templateExists)
 	}
 
 	if md.Spec.Rollout.Strategy.Type == clusterv1.RollingUpdateMachineDeploymentStrategyType {
-		return r.rolloutRollingUpdate(ctx, md, s.machineSets, s.machines, templateExists)
+		return r.rolloutRollingUpdate(ctx, s, templateExists)
 	}
 
 	if md.Spec.Rollout.Strategy.Type == clusterv1.OnDeleteMachineDeploymentStrategyType {
-		return r.rolloutOnDelete(ctx, md, s.machineSets, s.machines, templateExists)
+		return r.rolloutOnDelete(ctx, s, templateExists)
 	}
 
 	return errors.Errorf("unexpected deployment strategy type: %s", md.Spec.Rollout.Strategy.Type)
