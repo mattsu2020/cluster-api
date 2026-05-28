@@ -98,6 +98,18 @@ func setReplicas(machineDeployment *clusterv1.MachineDeployment, machineSets []*
 	}
 }
 
+// machineSetReplicaCount returns the replica count for a MachineSet, preferring status
+// (actual count) over spec (desired count) as a fallback when status is not yet available.
+func machineSetReplicaCount(ms *clusterv1.MachineSet) int32 {
+	if ms == nil {
+		return 0
+	}
+	if ms.Status.Replicas != nil {
+		return *ms.Status.Replicas
+	}
+	return ptr.Deref(ms.Spec.Replicas, 0)
+}
+
 func setPhase(_ context.Context, machineDeployment *clusterv1.MachineDeployment, machineSets []*clusterv1.MachineSet, getAndAdoptMachineSetsForDeploymentSucceeded bool) {
 	if !getAndAdoptMachineSetsForDeploymentSucceeded || machineDeployment.Spec.Replicas == nil {
 		machineDeployment.Status.Phase = string(clusterv1.MachineDeploymentPhaseUnknown)
@@ -210,16 +222,18 @@ func setRollingOutCondition(_ context.Context, machineDeployment *clusterv1.Mach
 	// if individual machine UpToDate conditions haven't been updated yet.
 	// This makes the MachineDeployment status reflect a pending rollout in the same patch
 	// that advances observedGeneration, even before individual Machine UpToDate conditions are updated.
-	if rollingOutReplicas == 0 && len(oldMSs) > 0 && newMS != nil {
+	if len(oldMSs) > 0 && newMS != nil {
 		oldReplicas := int32(0)
 		for _, oldMS := range oldMSs {
-			if oldMS != nil {
-				oldReplicas += max(ptr.Deref(oldMS.Spec.Replicas, 0), ptr.Deref(oldMS.Status.Replicas, 0))
-			}
+			oldReplicas += machineSetReplicaCount(oldMS)
 		}
 		if oldReplicas > 0 {
-			rollingOutReplicas = int(oldReplicas)
-			rolloutReasons.Insert("Rollout in progress (machines not yet updated)")
+			if oldReplicas > int32(rollingOutReplicas) {
+				rollingOutReplicas = int(oldReplicas)
+			}
+			if rollingOutReplicas == 0 {
+				rolloutReasons.Insert("Rollout in progress (machines not yet updated)")
+			}
 		}
 	}
 
@@ -412,24 +426,34 @@ func setMachinesReadyCondition(ctx context.Context, machineDeployment *clusterv1
 func setMachinesUpToDateCondition(ctx context.Context, machineDeployment *clusterv1.MachineDeployment, machines collections.Machines, newMS *clusterv1.MachineSet, oldMSs []*clusterv1.MachineSet) {
 	log := ctrl.LoggerFrom(ctx)
 
-	// If there are old MachineSets with replicas, machines are not up-to-date even if their
-	// individual UpToDate condition hasn't been updated yet. This makes the MachinesUpToDate
-	// condition reflect the pending rollout in the same patch that advances observedGeneration.
+	// If there are old MachineSets with replicas and no Machine has UpToDate=False yet,
+	// use MachineSet state as fallback. This makes the MachinesUpToDate condition reflect
+	// the pending rollout in the same patch that advances observedGeneration.
+	// When at least one Machine already has UpToDate=False, defer to the aggregation below
+	// which provides more detailed reasons (e.g. "KubeadmConfig is not up-to-date").
 	if newMS != nil && len(oldMSs) > 0 {
-		oldReplicas := int32(0)
-		for _, oldMS := range oldMSs {
-			if oldMS != nil {
-				oldReplicas += max(ptr.Deref(oldMS.Spec.Replicas, 0), ptr.Deref(oldMS.Status.Replicas, 0))
+		hasNotUpToDateMachine := false
+		for _, machine := range machines {
+			c := conditions.Get(machine, clusterv1.MachineUpToDateCondition)
+			if c != nil && c.Status == metav1.ConditionFalse {
+				hasNotUpToDateMachine = true
+				break
 			}
 		}
-		if oldReplicas > 0 {
-			conditions.Set(machineDeployment, metav1.Condition{
-				Type:    clusterv1.MachineDeploymentMachinesUpToDateCondition,
-				Status:  metav1.ConditionFalse,
-				Reason:  clusterv1.MachineDeploymentMachinesNotUpToDateReason,
-				Message: fmt.Sprintf("Rollout in progress, %d replicas not up-to-date", oldReplicas),
-			})
-			return
+		if !hasNotUpToDateMachine {
+			oldReplicas := int32(0)
+			for _, oldMS := range oldMSs {
+				oldReplicas += machineSetReplicaCount(oldMS)
+			}
+			if oldReplicas > 0 {
+				conditions.Set(machineDeployment, metav1.Condition{
+					Type:    clusterv1.MachineDeploymentMachinesUpToDateCondition,
+					Status:  metav1.ConditionFalse,
+					Reason:  clusterv1.MachineDeploymentMachinesNotUpToDateReason,
+					Message: fmt.Sprintf("Rollout in progress, %d replicas not up-to-date", oldReplicas),
+				})
+				return
+			}
 		}
 	}
 

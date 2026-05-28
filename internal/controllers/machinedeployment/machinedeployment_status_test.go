@@ -913,6 +913,8 @@ func Test_setMachinesUpToDateCondition(t *testing.T) {
 		name              string
 		machineDeployment *clusterv1.MachineDeployment
 		machines          []*clusterv1.Machine
+		newMS             *clusterv1.MachineSet
+		oldMSs            []*clusterv1.MachineSet
 		expectCondition   metav1.Condition
 	}{
 		{
@@ -1030,6 +1032,47 @@ func Test_setMachinesUpToDateCondition(t *testing.T) {
 					"* Machines no-condition-machine-1, no-condition-machine-2: Condition UpToDate not yet reported",
 			},
 		},
+		{
+			name:              "pending rollout detected from old MachineSets, machines still up-to-date",
+			machineDeployment: &clusterv1.MachineDeployment{},
+			machines: []*clusterv1.Machine{
+				fakeMachine("machine-1", withCondition(metav1.Condition{
+					Type:   clusterv1.MachineUpToDateCondition,
+					Status: metav1.ConditionTrue,
+					Reason: clusterv1.MachineUpToDateReason,
+				})),
+			},
+			newMS: fakeMachineSet("new-ms", withStatusReplicas(0)),
+			oldMSs: []*clusterv1.MachineSet{
+				fakeMachineSet("old-ms", withSpecReplicas(1), withStatusReplicas(1)),
+			},
+			expectCondition: metav1.Condition{
+				Type:   clusterv1.MachineDeploymentMachinesUpToDateCondition,
+				Status: metav1.ConditionFalse,
+				Reason: clusterv1.MachineDeploymentMachinesNotUpToDateReason,
+			},
+		},
+		{
+			name:              "machines already reporting UpToDate=False uses aggregation instead of oldMS fallback",
+			machineDeployment: &clusterv1.MachineDeployment{},
+			machines: []*clusterv1.Machine{
+				fakeMachine("machine-1", withCondition(metav1.Condition{
+					Type:    clusterv1.MachineUpToDateCondition,
+					Status:  metav1.ConditionFalse,
+					Reason:  clusterv1.MachineNotUpToDateReason,
+					Message: "* KubeadmConfig is not up-to-date",
+				})),
+			},
+			newMS: fakeMachineSet("new-ms", withStatusReplicas(0)),
+			oldMSs: []*clusterv1.MachineSet{
+				fakeMachineSet("old-ms", withSpecReplicas(1), withStatusReplicas(1)),
+			},
+			expectCondition: metav1.Condition{
+				Type:   clusterv1.MachineDeploymentMachinesUpToDateCondition,
+				Status: metav1.ConditionFalse,
+				Reason: clusterv1.MachineDeploymentMachinesNotUpToDateReason,
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1039,7 +1082,7 @@ func Test_setMachinesUpToDateCondition(t *testing.T) {
 			if tt.machines != nil {
 				machines = collections.FromMachines(tt.machines...)
 			}
-			setMachinesUpToDateCondition(ctx, tt.machineDeployment, machines, nil, nil)
+			setMachinesUpToDateCondition(ctx, tt.machineDeployment, machines, tt.newMS, tt.oldMSs)
 
 			condition := conditions.Get(tt.machineDeployment, clusterv1.MachineDeploymentMachinesUpToDateCondition)
 			g.Expect(condition).ToNot(BeNil())
