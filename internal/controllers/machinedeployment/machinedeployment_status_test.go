@@ -34,40 +34,44 @@ func Test_setReplicas(t *testing.T) {
 	tests := []struct {
 		name                    string
 		machineSets             []*clusterv1.MachineSet
+		newMS                   *clusterv1.MachineSet
 		expectReplicas          int32
 		expectReadyReplicas     *int32
 		expectAvailableReplicas *int32
 		expectUpToDateReplicas  *int32
 	}{
 		{
-			name:                    "No MachineSets",
+			name:                    "No MachineSets and no newMS",
 			machineSets:             nil,
+			newMS:                   nil,
 			expectReplicas:          0,
 			expectReadyReplicas:     nil,
 			expectAvailableReplicas: nil,
-			expectUpToDateReplicas:  nil,
+			expectUpToDateReplicas:  ptr.To(int32(0)),
 		},
 		{
-			name: "MachineSets without replicas set",
+			name: "MachineSets without replicas set, newMS has no status",
 			machineSets: []*clusterv1.MachineSet{
 				fakeMachineSet("ms1"),
 			},
+			newMS:                   fakeMachineSet("ms1"),
 			expectReplicas:          0,
 			expectReadyReplicas:     nil,
 			expectAvailableReplicas: nil,
-			expectUpToDateReplicas:  nil,
+			expectUpToDateReplicas:  ptr.To(int32(0)),
 		},
 		{
-			name: "MachineSets with replicas set",
+			name: "MachineSets with replicas set, UpToDateReplicas from newMS only",
 			machineSets: []*clusterv1.MachineSet{
 				fakeMachineSet("ms1", withStatusReplicas(6), withStatusV1beta2ReadyReplicas(5), withStatusV1beta2AvailableReplicas(3), withStatusV1beta2UpToDateReplicas(3)),
 				fakeMachineSet("ms2", withStatusReplicas(3), withStatusV1beta2ReadyReplicas(2), withStatusV1beta2AvailableReplicas(2), withStatusV1beta2UpToDateReplicas(1)),
 				fakeMachineSet("ms3"),
 			},
+			newMS:                   fakeMachineSet("ms1", withStatusReplicas(6), withStatusV1beta2ReadyReplicas(5), withStatusV1beta2AvailableReplicas(3), withStatusV1beta2UpToDateReplicas(3)),
 			expectReplicas:          9,
 			expectReadyReplicas:     ptr.To(int32(7)),
 			expectAvailableReplicas: ptr.To(int32(5)),
-			expectUpToDateReplicas:  ptr.To(int32(4)),
+			expectUpToDateReplicas:  ptr.To(int32(3)),
 		},
 	}
 	for _, tt := range tests {
@@ -75,7 +79,7 @@ func Test_setReplicas(t *testing.T) {
 			g := NewWithT(t)
 
 			md := &clusterv1.MachineDeployment{}
-			setReplicas(md, tt.machineSets)
+			setReplicas(md, tt.machineSets, tt.newMS)
 
 			g.Expect(md.Status.ReadyReplicas).To(Equal(tt.expectReadyReplicas))
 			g.Expect(md.Status.AvailableReplicas).To(Equal(tt.expectAvailableReplicas))
@@ -252,6 +256,8 @@ func Test_setRollingOutCondition(t *testing.T) {
 		name              string
 		machineDeployment *clusterv1.MachineDeployment
 		machines          []*clusterv1.Machine
+		newMS             *clusterv1.MachineSet
+		oldMSs            []*clusterv1.MachineSet
 		expectCondition   metav1.Condition
 	}{
 		{
@@ -311,6 +317,22 @@ func Test_setRollingOutCondition(t *testing.T) {
 					"* InfrastructureMachine is not up-to-date",
 			},
 		},
+		{
+			name:              "pending rollout detected from old MachineSets with replicas",
+			machineDeployment: &clusterv1.MachineDeployment{},
+			machines: []*clusterv1.Machine{
+				fakeMachine("machine-1", withCondition(upToDateCondition)),
+			},
+			newMS: fakeMachineSet("new-ms", withStatusReplicas(0)),
+			oldMSs: []*clusterv1.MachineSet{
+				fakeMachineSet("old-ms", withSpecReplicas(1), withStatusReplicas(1)),
+			},
+			expectCondition: metav1.Condition{
+				Type:   clusterv1.MachineDeploymentRollingOutCondition,
+				Status: metav1.ConditionTrue,
+				Reason: clusterv1.MachineDeploymentRollingOutReason,
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -320,7 +342,7 @@ func Test_setRollingOutCondition(t *testing.T) {
 			if tt.machines != nil {
 				machines = collections.FromMachines(tt.machines...)
 			}
-			setRollingOutCondition(ctx, tt.machineDeployment, machines)
+			setRollingOutCondition(ctx, tt.machineDeployment, machines, tt.newMS, tt.oldMSs)
 
 			condition := conditions.Get(tt.machineDeployment, clusterv1.MachineDeploymentRollingOutCondition)
 			g.Expect(condition).ToNot(BeNil())
@@ -1017,7 +1039,7 @@ func Test_setMachinesUpToDateCondition(t *testing.T) {
 			if tt.machines != nil {
 				machines = collections.FromMachines(tt.machines...)
 			}
-			setMachinesUpToDateCondition(ctx, tt.machineDeployment, machines)
+			setMachinesUpToDateCondition(ctx, tt.machineDeployment, machines, nil, nil)
 
 			condition := conditions.Get(tt.machineDeployment, clusterv1.MachineDeploymentMachinesUpToDateCondition)
 			g.Expect(condition).ToNot(BeNil())
@@ -1226,6 +1248,12 @@ func fakeMachineSet(name string, options ...fakeMachineSetOption) *clusterv1.Mac
 		opt(p)
 	}
 	return p
+}
+
+func withSpecReplicas(n int32) fakeMachineSetOption {
+	return func(ms *clusterv1.MachineSet) {
+		ms.Spec.Replicas = ptr.To(n)
+	}
 }
 
 func withStatusReplicas(n int32) fakeMachineSetOption {

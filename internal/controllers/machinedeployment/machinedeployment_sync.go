@@ -220,23 +220,20 @@ func (r *Reconciler) scale(ctx context.Context, deployment *clusterv1.MachineDep
 }
 
 // syncDeploymentStatus checks if the status is up-to-date and sync it if necessary.
+// Note: Replica counters are computed in the defer block's updateStatus() to avoid
+// dual-computation issues where observedGeneration advances before status fields are consistent.
 func (r *Reconciler) syncDeploymentStatus(allMSs []*clusterv1.MachineSet, newMS *clusterv1.MachineSet, md *clusterv1.MachineDeployment) error {
-	// Set replica counters on MD status.
-	setReplicas(md, allMSs)
 	calculateV1Beta1Status(allMSs, newMS, md)
 
 	// minReplicasNeeded will be equal to md.Spec.Replicas when the strategy is not RollingUpdateMachineDeploymentStrategyType.
 	minReplicasNeeded := *(md.Spec.Replicas) - mdutil.MaxUnavailable(*md)
 
-	availableReplicas := int32(0)
-	if md.Status.Deprecated != nil && md.Status.Deprecated.V1Beta1 != nil {
-		availableReplicas = md.Status.Deprecated.V1Beta1.AvailableReplicas
-	}
+	availableReplicas := ptr.Deref(md.Status.AvailableReplicas, 0)
 	if availableReplicas >= minReplicasNeeded {
 		// NOTE: The structure of calculateV1Beta1Status() does not allow us to update the machinedeployment directly, we can only update the status obj it returns. Ideally, we should change calculateV1Beta1Status() --> updateStatus() to be consistent with the rest of the code base, until then, we update conditions here.
 		v1beta1conditions.MarkTrue(md, clusterv1.MachineDeploymentAvailableV1Beta1Condition)
 	} else {
-		v1beta1conditions.MarkFalse(md, clusterv1.MachineDeploymentAvailableV1Beta1Condition, clusterv1.WaitingForAvailableMachinesV1Beta1Reason, clusterv1.ConditionSeverityWarning, "Minimum availability requires %d replicas, current %d available", minReplicasNeeded, ptr.Deref(md.Status.AvailableReplicas, 0))
+		v1beta1conditions.MarkFalse(md, clusterv1.MachineDeploymentAvailableV1Beta1Condition, clusterv1.WaitingForAvailableMachinesV1Beta1Reason, clusterv1.ConditionSeverityWarning, "Minimum availability requires %d replicas, current %d available", minReplicasNeeded, availableReplicas)
 	}
 
 	if newMS != nil {

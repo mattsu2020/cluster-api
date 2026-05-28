@@ -232,6 +232,11 @@ type scope struct {
 	infrastructureTemplateNotFound               bool
 	infrastructureTemplateExists                 bool
 	getAndAdoptMachineSetsForDeploymentSucceeded bool
+	// newMS is the MachineSet matching the current MachineDeployment template.
+	// oldMSs are MachineSets with an outdated template.
+	// Computed in updateStatus() via FindNewAndOldMachineSets.
+	newMS  *clusterv1.MachineSet
+	oldMSs []*clusterv1.MachineSet
 }
 
 func patchMachineDeployment(ctx context.Context, patchHelper *patch.Helper, md *clusterv1.MachineDeployment, options ...patch.Option) error {

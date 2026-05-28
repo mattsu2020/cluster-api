@@ -50,20 +50,29 @@ func (r *Reconciler) updateStatus(ctx context.Context, s *scope) (retErr error) 
 	}
 	s.machineDeployment.Status.Selector = selector.String()
 
-	// If the controller could read MachineSets, update replica counters.
+	// Partition MachineSets into new (matching current template) and old (outdated template).
+	// This is used for replica counters and condition computation.
 	if s.getAndAdoptMachineSetsForDeploymentSucceeded {
-		setReplicas(s.machineDeployment, s.machineSets)
+		newMS, oldMSs, _, _ := mdutil.FindNewAndOldMachineSets(s.machineDeployment, s.machineSets, metav1.Now())
+		s.newMS = newMS
+		s.oldMSs = oldMSs
+	}
+
+	// If the controller could read MachineSets, update replica counters.
+	// UpToDateReplicas counts only machines matching the current template (new MS).
+	if s.getAndAdoptMachineSetsForDeploymentSucceeded {
+		setReplicas(s.machineDeployment, s.machineSets, s.newMS)
 	}
 	setPhase(ctx, s.machineDeployment, s.machineSets, s.getAndAdoptMachineSetsForDeploymentSucceeded)
 
 	setAvailableCondition(ctx, s.machineDeployment, s.getAndAdoptMachineSetsForDeploymentSucceeded)
 
-	setRollingOutCondition(ctx, s.machineDeployment, s.machines)
+	setRollingOutCondition(ctx, s.machineDeployment, s.machines, s.newMS, s.oldMSs)
 	setScalingUpCondition(ctx, s.machineDeployment, s.machineSets, s.bootstrapTemplateNotFound, s.infrastructureTemplateNotFound, s.getAndAdoptMachineSetsForDeploymentSucceeded)
 	setScalingDownCondition(ctx, s.machineDeployment, s.machineSets, s.machines, s.getAndAdoptMachineSetsForDeploymentSucceeded)
 
 	setMachinesReadyCondition(ctx, s.machineDeployment, s.machines)
-	setMachinesUpToDateCondition(ctx, s.machineDeployment, s.machines)
+	setMachinesUpToDateCondition(ctx, s.machineDeployment, s.machines, s.newMS, s.oldMSs)
 
 	setRemediatingCondition(ctx, s.machineDeployment, machinesToBeRemediated, unhealthyMachines)
 
@@ -73,16 +82,19 @@ func (r *Reconciler) updateStatus(ctx context.Context, s *scope) (retErr error) 
 }
 
 // setReplicas sets replicas in status.
-// Note: this controller computes replicas several time during a reconcile, because those counters are
-// used by low level operations to take decisions, but also those decisions might impact the very same the counters
-// e.g. scale up MachinesSet is based on counters and it can change the value on MachineSet's replica number;
-// as a consequence it is required to compute the counters again before calling scale down machine sets,
-// and again to before computing the overall availability of the Machine deployment.
-func setReplicas(machineDeployment *clusterv1.MachineDeployment, machineSets []*clusterv1.MachineSet) {
+// UpToDateReplicas is computed from the new MachineSet only (matching the current template),
+// matching the Kubernetes Deployment behavior where updatedReplicas counts pods from the new ReplicaSet.
+// Other replica counters are summed across all MachineSets.
+func setReplicas(machineDeployment *clusterv1.MachineDeployment, machineSets []*clusterv1.MachineSet, newMS *clusterv1.MachineSet) {
 	machineDeployment.Status.Replicas = mdutil.GetActualReplicaCountForMachineSets(machineSets)
 	machineDeployment.Status.ReadyReplicas = mdutil.GetReadyReplicaCountForMachineSets(machineSets)
 	machineDeployment.Status.AvailableReplicas = mdutil.GetAvailableReplicaCountForMachineSets(machineSets)
-	machineDeployment.Status.UpToDateReplicas = mdutil.GetUptoDateReplicaCountForMachineSets(machineSets)
+	// UpToDateReplicas counts only machines matching the current template (new MS).
+	if newMS != nil && newMS.Status.UpToDateReplicas != nil {
+		machineDeployment.Status.UpToDateReplicas = newMS.Status.UpToDateReplicas
+	} else {
+		machineDeployment.Status.UpToDateReplicas = ptr.To[int32](0)
+	}
 }
 
 func setPhase(_ context.Context, machineDeployment *clusterv1.MachineDeployment, machineSets []*clusterv1.MachineSet, getAndAdoptMachineSetsForDeploymentSucceeded bool) {
@@ -173,7 +185,7 @@ func setAvailableCondition(_ context.Context, machineDeployment *clusterv1.Machi
 	})
 }
 
-func setRollingOutCondition(_ context.Context, machineDeployment *clusterv1.MachineDeployment, machines collections.Machines) {
+func setRollingOutCondition(_ context.Context, machineDeployment *clusterv1.MachineDeployment, machines collections.Machines, newMS *clusterv1.MachineSet, oldMSs []*clusterv1.MachineSet) {
 	// Count machines rolling out and collect reasons why a rollout is happening.
 	// Note: The code below collects all the reasons for which at least a machine is rolling out; under normal circumstances
 	// all the machines are rolling out for the same reasons, however, in case of changes to
@@ -189,6 +201,23 @@ func setRollingOutCondition(_ context.Context, machineDeployment *clusterv1.Mach
 		rollingOutReplicas++
 		if upToDateCondition.Message != "" {
 			rolloutReasons.Insert(strings.Split(upToDateCondition.Message, "\n")...)
+		}
+	}
+
+	// Also detect pending rollouts from MachineSet state. When old MachineSets have replicas
+	// and a new MachineSet exists with a different template, a rollout is in progress even
+	// if individual machine UpToDate conditions haven't been updated yet.
+	// This prevents observedGeneration from advancing while conditions still reflect the old state.
+	if rollingOutReplicas == 0 && len(oldMSs) > 0 && newMS != nil {
+		oldReplicas := int32(0)
+		for _, oldMS := range oldMSs {
+			if oldMS != nil {
+				oldReplicas += max(ptr.Deref(oldMS.Spec.Replicas, 0), ptr.Deref(oldMS.Status.Replicas, 0))
+			}
+		}
+		if oldReplicas > 0 {
+			rollingOutReplicas = int(oldReplicas)
+			rolloutReasons.Insert("Rollout in progress (machines not yet updated)")
 		}
 	}
 
@@ -378,8 +407,30 @@ func setMachinesReadyCondition(ctx context.Context, machineDeployment *clusterv1
 	conditions.Set(machineDeployment, *readyCondition)
 }
 
-func setMachinesUpToDateCondition(ctx context.Context, machineDeployment *clusterv1.MachineDeployment, machines collections.Machines) {
+func setMachinesUpToDateCondition(ctx context.Context, machineDeployment *clusterv1.MachineDeployment, machines collections.Machines, newMS *clusterv1.MachineSet, oldMSs []*clusterv1.MachineSet) {
 	log := ctrl.LoggerFrom(ctx)
+
+	// If there are old MachineSets with replicas, machines are not up-to-date even if their
+	// individual UpToDate condition hasn't been updated yet. This prevents the condition from
+	// reporting True when a rollout is pending but machine controllers haven't caught up.
+	if newMS != nil && len(oldMSs) > 0 {
+		oldReplicas := int32(0)
+		for _, oldMS := range oldMSs {
+			if oldMS != nil {
+				oldReplicas += max(ptr.Deref(oldMS.Spec.Replicas, 0), ptr.Deref(oldMS.Status.Replicas, 0))
+			}
+		}
+		if oldReplicas > 0 {
+			conditions.Set(machineDeployment, metav1.Condition{
+				Type:    clusterv1.MachineDeploymentMachinesUpToDateCondition,
+				Status:  metav1.ConditionFalse,
+				Reason:  clusterv1.MachineDeploymentMachinesNotUpToDateReason,
+				Message: fmt.Sprintf("Rollout in progress, %d replicas not up-to-date", oldReplicas),
+			})
+			return
+		}
+	}
+
 	// Only consider Machines that have an UpToDate condition or are older than 10s.
 	// This is done to ensure the MachinesUpToDate condition doesn't flicker after a new Machine is created,
 	// because it can take a bit until the UpToDate condition is set on a new Machine.
