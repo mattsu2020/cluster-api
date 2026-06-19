@@ -2,6 +2,14 @@
 
 <!-- TOC -->
 * [Troubleshooting](#troubleshooting)
+  * [General troubleshooting workflow](#general-troubleshooting-workflow)
+    * [1. Verify the management cluster and providers](#1-verify-the-management-cluster-and-providers)
+    * [2. Find the resource that is not progressing](#2-find-the-resource-that-is-not-progressing)
+    * [3. Inspect Conditions and Events](#3-inspect-conditions-and-events)
+    * [4. Inspect provider logs](#4-inspect-provider-logs)
+    * [5. Inspect the workload cluster and Nodes](#5-inspect-the-workload-cluster-and-nodes)
+    * [6. Inspect the infrastructure and bootstrap process](#6-inspect-the-infrastructure-and-bootstrap-process)
+    * [7. Collect information for further investigation](#7-collect-information-for-further-investigation)
   * [Troubleshooting Quick Start with Docker (CAPD)](#troubleshooting-quick-start-with-docker-capd)
   * [Node bootstrap failures when using CABPK with cloud-init](#node-bootstrap-failures-when-using-cabpk-with-cloud-init)
   * [Labeling nodes with reserved labels such as `node-role.kubernetes.io` fails with kubeadm error during bootstrap](#labeling-nodes-with-reserved-labels-such-as-node-rolekubernetesio-fails-with-kubeadm-error-during-bootstrap)
@@ -15,6 +23,173 @@
   * [Failed to removed fields from lists using Server Side Apply](#failed-to-removed-fields-from-lists-using-server-side-apply)
   * [kubeadm join fails after upgrading to Kubernetes v1.36.1 / v1.35.5 / v1.34.8 / v1.33.12](#kubeadm-join-fails-after-upgrading-to-kubernetes-patch-releases)
 <!-- TOC -->
+
+## General troubleshooting workflow
+
+Cluster API manages workload clusters through resources and controllers in a management cluster. Start troubleshooting
+from the management cluster, even when the symptom is a workload cluster that cannot be reached. The resource `Conditions`,
+Kubernetes Events, and provider controller logs usually identify the component where reconciliation stopped.
+
+The examples below use `<cluster-name>` and `<namespace>` for the workload Cluster resource. Cluster API resources are
+namespaced, so include `--namespace <namespace>` (or `-n <namespace>`) when the Cluster is not in the current namespace.
+
+### 1. Verify the management cluster and providers
+
+First, confirm that `kubectl` and `clusterctl` are using the expected management cluster:
+
+```bash
+kubectl config current-context
+kubectl cluster-info
+clusterctl get providers
+```
+
+`clusterctl get providers` lists the installed core, bootstrap, control plane, and infrastructure providers and their
+target namespaces. Check that the controller Deployments in those namespaces are available. For example:
+
+```bash
+kubectl get deployments -n capi-system
+kubectl get pods -n <provider-namespace>
+```
+
+If a provider Pod is not `Running` and ready, inspect it before troubleshooting an individual workload cluster:
+
+```bash
+kubectl describe pod -n <provider-namespace> <provider-pod>
+kubectl logs -n <provider-namespace> <provider-pod> --all-containers --previous
+```
+
+The `--previous` flag shows logs from the previous container instance and is useful for `CrashLoopBackOff`. Omit it if
+the container has not restarted.
+
+### 2. Find the resource that is not progressing
+
+Use `clusterctl describe cluster` for an overview of the Cluster and its resource hierarchy:
+
+```bash
+clusterctl describe cluster <cluster-name> --namespace <namespace>
+```
+
+Start with the first resource that reports `READY` as `False` or `Unknown`. The displayed reason and message often
+identify the next resource to inspect. By default, the command groups Machines with the same state and hides bootstrap
+and infrastructure objects when their state matches the owning Machine. Disable those shortcuts when more detail is
+needed:
+
+```bash
+clusterctl describe cluster <cluster-name> --namespace <namespace> --grouping=false --echo
+```
+
+See the [`clusterctl describe cluster` command](../clusterctl/commands/describe-cluster.md) for more visualization
+options.
+
+### 3. Inspect Conditions and Events
+
+Show all Conditions in the resource hierarchy:
+
+```bash
+clusterctl describe cluster <cluster-name> --namespace <namespace> --show-conditions all
+```
+
+For the resource that is not progressing, inspect its complete status and Events. Replace `<kind>` and `<name>` with
+values such as `cluster` and the Cluster name, `machine` and a Machine name, or a provider-specific resource and name:
+
+```bash
+kubectl describe <kind> <name> --namespace <namespace>
+kubectl get <kind> <name> --namespace <namespace> -o yaml
+kubectl get events --namespace <namespace> --sort-by=.lastTimestamp
+```
+
+When reading a Condition, use these fields together:
+
+* `type` identifies the aspect of the resource being reported.
+* `status` indicates whether the condition is `True`, `False`, or `Unknown`.
+* `reason` and `message` explain the current state and usually identify the next troubleshooting action.
+* `lastTransitionTime` indicates when the state last changed.
+* `observedGeneration`, when present, shows which resource generation the controller observed. If it is lower than
+  `metadata.generation`, the controller has not processed the latest specification yet.
+
+Follow object references in `spec`, `status`, and `metadata.ownerReferences`. For example, a Machine can point to a
+bootstrap configuration and an infrastructure Machine. Inspect the referenced object when the Machine Condition reports
+a bootstrap or infrastructure failure.
+
+Events are best used with Conditions and logs. They can be repeated, aggregated, or removed over time, so the absence of
+an Event does not prove that an error did not occur.
+
+### 4. Inspect provider logs
+
+The failing resource type determines which controller logs to inspect:
+
+* `Cluster`, `Machine`, `MachineSet`, and `MachineDeployment`: core provider.
+* `KubeadmConfig`: kubeadm bootstrap provider.
+* `KubeadmControlPlane`: kubeadm control plane provider.
+* Provider-specific infrastructure resources: the corresponding infrastructure provider.
+
+Use the provider namespace from `clusterctl get providers`, find its controller Deployment, and read the manager
+container logs around the time shown by the Condition or Event:
+
+```bash
+kubectl get deployments -n <provider-namespace>
+kubectl logs -n <provider-namespace> deployment/<provider-controller-manager> \
+  -c manager --since=30m
+```
+
+Search for the Cluster or failing resource name. Include timestamps if logs need to be correlated across controllers:
+
+```bash
+kubectl logs -n <provider-namespace> deployment/<provider-controller-manager> \
+  -c manager --since=30m --timestamps | grep '<cluster-name>\|<resource-name>'
+```
+
+If the controller has restarted, also inspect the previous container logs with `--previous`. Errors from an external
+cloud or infrastructure API can require checking credentials, quotas, permissions, networking, or service health outside
+the management cluster.
+
+### 5. Inspect the workload cluster and Nodes
+
+Continue on the workload cluster only after the control plane is initialized and a kubeconfig is available:
+
+```bash
+clusterctl get kubeconfig <cluster-name> --namespace <namespace> > <cluster-name>.kubeconfig
+kubectl --kubeconfig <cluster-name>.kubeconfig get nodes -o wide
+kubectl --kubeconfig <cluster-name>.kubeconfig get pods -A
+kubectl --kubeconfig <cluster-name>.kubeconfig get events -A --sort-by=.lastTimestamp
+```
+
+If the API server cannot be reached, return to the management cluster and inspect the control plane, infrastructure,
+load balancer, and network configuration. If the API server is reachable but a Node is not ready, inspect the Node and
+the system Pods scheduled to it:
+
+```bash
+kubectl --kubeconfig <cluster-name>.kubeconfig describe node <node-name>
+kubectl --kubeconfig <cluster-name>.kubeconfig get pods -A \
+  --field-selector spec.nodeName=<node-name>
+```
+
+### 6. Inspect the infrastructure and bootstrap process
+
+When a Machine remains in provisioning or bootstrap fails, inspect the actual machine through the infrastructure
+provider. Depending on the provider, this can mean a virtual machine, container, bare-metal host, or cloud instance.
+Verify that it exists, is powered on, has the expected network connectivity, and can reach the workload cluster API
+endpoint and required image registries.
+
+If access to the machine is available, inspect the bootstrap and node service logs. The exact commands depend on the
+operating system and bootstrap provider. For kubeadm with cloud-init, see
+[Node bootstrap failures when using CABPK with cloud-init](#node-bootstrap-failures-when-using-cabpk-with-cloud-init).
+
+### 7. Collect information for further investigation
+
+If the cause is still unclear, collect enough information to reproduce the timeline before resources or Events are
+deleted. At minimum, include:
+
+* Cluster API and provider versions from `clusterctl get providers`.
+* Kubernetes versions for the management and workload clusters.
+* `clusterctl describe cluster` output with `--show-conditions all --grouping=false --echo`.
+* YAML and Events for the resources that are not progressing.
+* Relevant provider logs with timestamps and the time range in which the failure occurred.
+* The infrastructure or bootstrap logs, when applicable.
+* The steps that triggered the problem and whether it is reproducible.
+
+Remove credentials, kubeconfig data, Secrets, cloud-init user data, tokens, and other sensitive values before sharing
+the collected information.
 
 ## Troubleshooting Quick Start with Docker (CAPD)
 
